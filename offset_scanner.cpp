@@ -2,41 +2,70 @@
 #define NOMINMAX
 
 #include <windows.h>
-#include <tlhelp32.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <cwchar>
 #include <iomanip>
 #include <iostream>
+#include <string>
+#include <vector>
 
 namespace {
 
-constexpr wchar_t kProcessName[] = L"crossfire.exe";
+constexpr wchar_t kTargetName[] = L"crossfire.exe";
+constexpr ULONG kSystemProcessInformation = 5;
 constexpr ULONG kProcessBasicInformation = 0;
 constexpr ULONG kProcessWow64Information = 26;
+constexpr LONG kStatusInfoLengthMismatch = -1073741820L;
 
-using NtQueryInformationProcessFn = LONG(NTAPI*)(
-    HANDLE, ULONG, PVOID, ULONG, PULONG
-);
+struct UnicodeString {
+    USHORT length;
+    USHORT maximumLength;
+    PWSTR buffer;
+};
 
-struct ProcessBasicInformation {
+struct SystemProcessInformation {
+    ULONG nextEntryOffset;
+    ULONG numberOfThreads;
+    LARGE_INTEGER workingSetPrivateSize;
+    ULONG hardFaultCount;
+    ULONG numberOfThreadsHighWatermark;
+    ULONGLONG cycleTime;
+    LARGE_INTEGER createTime;
+    LARGE_INTEGER userTime;
+    LARGE_INTEGER kernelTime;
+    UnicodeString imageName;
+    LONG basePriority;
+    HANDLE uniqueProcessId;
+    HANDLE inheritedProcessId;
+};
+
+struct BasicProcessInformation {
     LONG exitStatus;
     PVOID pebBaseAddress;
     ULONG_PTR affinityMask;
     LONG basePriority;
     ULONG_PTR uniqueProcessId;
-    ULONG_PTR inheritedFromUniqueProcessId;
+    ULONG_PTR inheritedProcessId;
 };
+
+using NtQuerySystemInformationFn = LONG(NTAPI*)(
+    ULONG, PVOID, ULONG, PULONG
+);
+
+using NtQueryInformationProcessFn = LONG(NTAPI*)(
+    HANDLE, ULONG, PVOID, ULONG, PULONG
+);
 
 class UniqueHandle {
 public:
-    explicit UniqueHandle(HANDLE handle = INVALID_HANDLE_VALUE)
-        : handle_(handle) {}
+    explicit UniqueHandle(HANDLE value = nullptr) : value_(value) {}
 
     ~UniqueHandle() {
-        if (handle_ != nullptr && handle_ != INVALID_HANDLE_VALUE) {
-            CloseHandle(handle_);
+        if (value_ != nullptr && value_ != INVALID_HANDLE_VALUE) {
+            CloseHandle(value_);
         }
     }
 
@@ -44,82 +73,118 @@ public:
     UniqueHandle& operator=(const UniqueHandle&) = delete;
 
     HANDLE get() const {
-        return handle_;
+        return value_;
     }
 
-    HANDLE get() const { return handle_; }
     explicit operator bool() const {
-        return handle_ != nullptr && handle_ != INVALID_HANDLE_VALUE;
+        return value_ != nullptr && value_ != INVALID_HANDLE_VALUE;
     }
 
 private:
-    HANDLE handle_;
+    HANDLE value_;
 };
+
+template <typename Function>
+Function ResolveNtdllFunction(const char* name) {
+    const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (ntdll == nullptr) {
+        return nullptr;
+    }
+
+    const FARPROC address = GetProcAddress(ntdll, name);
+    Function function = nullptr;
+    static_assert(sizeof(function) == sizeof(address));
+    std::memcpy(&function, &address, sizeof(function));
+    return function;
+}
 
 void WaitForExit() {
     std::cout << "Press Enter to exit...";
     std::cin.get();
 }
 
-DWORD FindProcessId() {
-    UniqueHandle snapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
-    if (!snapshot) {
-        std::cerr << "CreateToolhelp32Snapshot(process) failed, Win32="
-                  << GetLastError() << '\n';
-        std::cerr << "Process snapshot failed, Win32=" << GetLastError() << '\n';
-        return 0;
-    }
+DWORD FindProcessId(NtQuerySystemInformationFn querySystem) {
+    std::vector<std::byte> buffer(64 * 1024);
+    LONG status = 0;
 
-    PROCESSENTRY32W entry{};
-    entry.dwSize = static_cast<DWORD>(sizeof(entry));
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        ULONG required = 0;
+        status = querySystem(
+            kSystemProcessInformation,
+            buffer.data(),
+            static_cast<ULONG>(buffer.size()),
+            &required
+        );
 
-    if (!Process32FirstW(snapshot.get(), &entry)) {
-        std::cerr << "Process32FirstW failed, Win32="
-                  << GetLastError() << '\n';
-        std::cerr << "Process32FirstW failed, Win32=" << GetLastError() << '\n';
-        return 0;
-    }
-
-    do {
-        if (_wcsicmp(entry.szExeFile, kProcessName) == 0) {
-            return entry.th32ProcessID;
+        if (status >= 0) {
+            break;
         }
-    } while (Process32NextW(snapshot.get(), &entry));
+
+        if (status != kStatusInfoLengthMismatch) {
+            std::cerr
+                << "NtQuerySystemInformation failed, NTSTATUS=0x"
+                << std::hex
+                << std::uppercase
+                << static_cast<std::uint32_t>(status)
+                << std::dec
+                << '\n';
+            return 0;
+        }
+
+        const std::size_t nextSize = required != 0
+            ? static_cast<std::size_t>(required) + 64 * 1024
+            : buffer.size() * 2;
+
+        buffer.resize(nextSize);
+    }
+
+    if (status < 0) {
+        std::cerr << "The process list buffer could not be allocated.\n";
+        return 0;
+    }
+
+    std::size_t offset = 0;
+
+    while (offset < buffer.size()) {
+        const auto* entry =
+            reinterpret_cast<const SystemProcessInformation*>(
+                buffer.data() + offset
+            );
+
+        if (entry->imageName.buffer != nullptr &&
+            entry->imageName.length != 0) {
+            const std::wstring name(
+                entry->imageName.buffer,
+                entry->imageName.length / sizeof(wchar_t)
+            );
+
+            if (_wcsicmp(name.c_str(), kTargetName) == 0) {
+                return static_cast<DWORD>(
+                    reinterpret_cast<ULONG_PTR>(
+                        entry->uniqueProcessId
+                    )
+                );
+            }
+        }
+
+        if (entry->nextEntryOffset == 0) {
+            break;
+        }
+
+        offset += entry->nextEntryOffset;
+    }
 
     return 0;
 }
 
-std::uintptr_t FindModuleBase(DWORD processId) {
-    UniqueHandle snapshot(CreateToolhelp32Snapshot(
-        TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32,
-        processId
-    ));
-
-    if (!snapshot) {
-        std::cerr << "CreateToolhelp32Snapshot(module) failed, Win32="
-                  << GetLastError() << '\n';
-        return 0;
-NtQueryInformationProcessFn ResolveNtQueryInformationProcess() {
-    const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
-    if (ntdll == nullptr) {
-        return nullptr;
-    }
-
-    MODULEENTRY32W module{};
-    module.dwSize = static_cast<DWORD>(sizeof(module));
-    const FARPROC address = GetProcAddress(ntdll, "NtQueryInformationProcess");
-    NtQueryInformationProcessFn function = nullptr;
-    static_assert(sizeof(function) == sizeof(address));
-    std::memcpy(&function, &address, sizeof(function));
-    return function;
-}
-
-    if (!Module32FirstW(snapshot.get(), &module)) {
-        std::cerr << "Module32FirstW failed, Win32="
-                  << GetLastError() << '\n';
-template <typename T>
-bool ReadRemote(HANDLE process, std::uintptr_t address, T& value) {
+template <typename Value>
+bool ReadRemote(
+    HANDLE process,
+    std::uintptr_t address,
+    Value& value
+) {
     SIZE_T bytesRead = 0;
+
     if (!ReadProcessMemory(
             process,
             reinterpret_cast<LPCVOID>(address),
@@ -127,121 +192,145 @@ bool ReadRemote(HANDLE process, std::uintptr_t address, T& value) {
             sizeof(value),
             &bytesRead
         ) || bytesRead != sizeof(value)) {
-        std::cerr << "ReadProcessMemory failed, Win32=" << GetLastError() << '\n';
+        std::cerr
+            << "ReadProcessMemory failed, Win32="
+            << GetLastError()
+            << '\n';
         return false;
     }
+
     return true;
 }
 
 std::uintptr_t FindImageBase(
     HANDLE process,
-    NtQueryInformationProcessFn ntQuery
+    NtQueryInformationProcessFn queryProcess
 ) {
-    BOOL isWow64 = FALSE;
-    if (!IsWow64Process(process, &isWow64)) {
-        std::cerr << "IsWow64Process failed, Win32=" << GetLastError() << '\n';
-        return 0;
-    }
+    ULONG_PTR wow64Peb = 0;
 
-    do {
-        if (_wcsicmp(module.szModule, kProcessName) == 0 ||
-            _wcsicmp(module.szExePath, kProcessName) == 0) {
-            return reinterpret_cast<std::uintptr_t>(module.modBaseAddr);
-    if (isWow64) {
-        ULONG_PTR peb32 = 0;
-        const LONG status = ntQuery(
-            process,
-            kProcessWow64Information,
-            &peb32,
-            static_cast<ULONG>(sizeof(peb32)),
-            nullptr
-        );
-        if (status < 0 || peb32 == 0) {
-            std::cerr << "NtQueryInformationProcess(WOW64) failed, NTSTATUS=0x"
-                      << std::hex << std::uppercase
-                      << static_cast<std::uint32_t>(status) << std::dec << '\n';
+    const LONG wow64Status = queryProcess(
+        process,
+        kProcessWow64Information,
+        &wow64Peb,
+        static_cast<ULONG>(sizeof(wow64Peb)),
+        nullptr
+    );
+
+    if (wow64Status >= 0 && wow64Peb != 0) {
+        std::uint32_t imageBase32 = 0;
+
+        if (!ReadRemote(
+                process,
+                wow64Peb + 0x08,
+                imageBase32
+            )) {
             return 0;
         }
-    } while (Module32NextW(snapshot.get(), &module));
 
-        std::uint32_t imageBase = 0;
-        if (!ReadRemote(process, static_cast<std::uintptr_t>(peb32) + 0x08, imageBase)) {
-    return 0;
-            return 0;
-        }
-        return static_cast<std::uintptr_t>(imageBase);
+        return static_cast<std::uintptr_t>(imageBase32);
     }
 
-    ProcessBasicInformation information{};
-    const LONG status = ntQuery(
+    BasicProcessInformation information{};
+
+    const LONG status = queryProcess(
         process,
         kProcessBasicInformation,
         &information,
         static_cast<ULONG>(sizeof(information)),
         nullptr
     );
+
     if (status < 0 || information.pebBaseAddress == nullptr) {
-        std::cerr << "NtQueryInformationProcess failed, NTSTATUS=0x"
-                  << std::hex << std::uppercase
-                  << static_cast<std::uint32_t>(status) << std::dec << '\n';
+        std::cerr
+            << "NtQueryInformationProcess failed, NTSTATUS=0x"
+            << std::hex
+            << std::uppercase
+            << static_cast<std::uint32_t>(status)
+            << std::dec
+            << '\n';
         return 0;
     }
 
     std::uintptr_t imageBase = 0;
-    const auto peb = reinterpret_cast<std::uintptr_t>(information.pebBaseAddress);
-    if (!ReadRemote(process, peb + 0x10, imageBase)) {
+
+    const auto pebAddress =
+        reinterpret_cast<std::uintptr_t>(
+            information.pebBaseAddress
+        );
+
+    if (!ReadRemote(
+            process,
+            pebAddress + 0x10,
+            imageBase
+        )) {
         return 0;
     }
+
     return imageBase;
 }
 
-}  // namespace
+} // namespace
 
 int main() {
-    std::cout << "Looking for crossfire.exe...\n";
+    const auto querySystem =
+        ResolveNtdllFunction<NtQuerySystemInformationFn>(
+            "NtQuerySystemInformation"
+        );
 
-    const DWORD processId = FindProcessId();
-    if (processId == 0) {
-        std::cerr << "crossfire.exe was not found.\n";
+    const auto queryProcess =
+        ResolveNtdllFunction<NtQueryInformationProcessFn>(
+            "NtQueryInformationProcess"
+        );
+
+    if (querySystem == nullptr || queryProcess == nullptr) {
+        std::cerr << "Required ntdll functions were not found.\n";
         WaitForExit();
         return 1;
     }
 
+    const DWORD processId = FindProcessId(querySystem);
+
+    if (processId == 0) {
+        std::cerr << "crossfire.exe was not found.\n";
+        WaitForExit();
+        return 2;
+    }
+
     std::cout << "PID: " << processId << '\n';
 
-    const std::uintptr_t moduleBase = FindModuleBase(processId);
-    if (moduleBase == 0) {
-        std::cerr << "The module base address was not available.\n";
     UniqueHandle process(OpenProcess(
         PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
         FALSE,
         processId
     ));
-    if (!process) {
-        std::cerr << "OpenProcess failed, Win32=" << GetLastError() << '\n';
-        WaitForExit();
-        return 2;
-    }
 
-    std::cout << "Module base: 0x"
-              << std::hex << std::uppercase << moduleBase
-              << std::dec << '\n';
-    const auto ntQuery = ResolveNtQueryInformationProcess();
-    if (ntQuery == nullptr) {
-        std::cerr << "NtQueryInformationProcess was not found.\n";
+    if (!process) {
+        std::cerr
+            << "OpenProcess failed, Win32="
+            << GetLastError()
+            << '\n';
         WaitForExit();
         return 3;
     }
 
-    const std::uintptr_t imageBase = FindImageBase(process.get(), ntQuery);
+    const std::uintptr_t imageBase =
+        FindImageBase(process.get(), queryProcess);
+
     if (imageBase == 0) {
-        std::cerr << "The image base address was not available.\n";
+        std::cerr
+            << "The module base address was not available.\n";
         WaitForExit();
         return 4;
     }
 
-    std::cout << "Module base: 0x"
-              << std::hex << std::uppercase << imageBase << std::dec << '\n';
+    std::cout
+        << "Module base: 0x"
+        << std::hex
+        << std::uppercase
+        << imageBase
+        << std::dec
+        << '\n';
+
     WaitForExit();
     return 0;
 }
