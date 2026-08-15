@@ -1,21 +1,45 @@
-name: Build Windows x64
+name: Build Offset Scanner Windows x64
 
 on:
   push:
     branches:
       - main
+    paths:
+      - offset_scanner.cpp
+      - .github/workflows/build.yml
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   build:
     runs-on: windows-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Configure MSVC x64
+        uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
-      - run: cl.exe /nologo /std:c++20 /EHsc /W4 /DUNICODE /D_UNICODE /Fe:crossfire_esp.exe crossfire_esp.cpp /link User32.lib Gdi32.lib Advapi32.lib
-      - uses: actions/upload-artifact@v4
+
+      - name: Compile offset_scanner.cpp
+        shell: cmd
+        run: cl.exe /nologo /std:c++20 /EHsc /W4 /DUNICODE /D_UNICODE /Fe:offset_scanner.exe offset_scanner.cpp
+
+      - name: Verify executable
+        shell: pwsh
+        run: |
+          if (-not (Test-Path -LiteralPath '.\offset_scanner.exe' -PathType Leaf)) {
+            throw 'offset_scanner.exe was not generated.'
+          }
+
+      - name: Upload executable
+        uses: actions/upload-artifact@v4
         with:
-          name: crossfire-esp-windows-x64
-          path: crossfire_esp.exe
+          name: offset-scanner-windows-x64
+          path: offset_scanner.exe
+          if-no-files-found: error
+          retention-days: 30
