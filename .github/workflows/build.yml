@@ -27,7 +27,7 @@ jobs:
 
       - name: Compile offset_scanner.cpp
         shell: cmd
-        run: cl.exe /nologo /std:c++20 /EHsc /W4 /DUNICODE /D_UNICODE /Fe:offset_scanner.exe offset_scanner.cpp
+       run: cl.exe /nologo /std:c++20 /EHsc /W4 /DUNICODE /D_UNICODE /Fe:offset_scanner.exe offset_scanner.cpp /link ntdll.lib advapi32.lib
 
       - name: Verify executable
         shell: pwsh
