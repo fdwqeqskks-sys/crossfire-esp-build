@@ -1,12 +1,8 @@
-name: Build Offset Scanner Windows x64
+name: Build Offset Scanner
 
 on:
   push:
-    branches:
-      - main
-    paths:
-      - offset_scanner.cpp
-      - .github/workflows/build.yml
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -17,29 +13,21 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      - name: Check out repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Configure MSVC x64
+      - name: Enable MSVC
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
-      - name: Compile offset_scanner.cpp
+      - name: Compile
         shell: cmd
-       run: cl.exe /nologo /std:c++20 /EHsc /W4 /DUNICODE /D_UNICODE /Fe:offset_scanner.exe offset_scanner.cpp /link ntdll.lib advapi32.lib
+        run: cl.exe /nologo /std:c++20 /EHsc /W4 /Fe:offset_scanner.exe offset_scanner.cpp
 
-      - name: Verify executable
-        shell: pwsh
-        run: |
-          if (-not (Test-Path -LiteralPath '.\offset_scanner.exe' -PathType Leaf)) {
-            throw 'offset_scanner.exe was not generated.'
-          }
-
-      - name: Upload executable
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: offset-scanner-windows-x64
           path: offset_scanner.exe
           if-no-files-found: error
-          retention-days: 30
